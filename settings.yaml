@@ -1,0 +1,27 @@
+exchange:
+  name: binance
+  proxy: null
+  timeout: 30
+
+monitor:
+  weights:
+    silent_accumulation: 0.25
+    cvd_anomaly: 0.20
+    oi_price_stable: 0.20
+    whale_divergence: 0.20
+    funding_divergence: 0.10
+    liquidity_thinning: 0.05
+  score_threshold: 60.0
+  high_priority_threshold: 80.0
+  dedup_minutes: 30
+  z_score_threshold: 3.0
+  baseline_hours: 12
+
+dingtalk:
+  webhook_url: ""
+  secret: ""
+  at_mobiles: []
+
+filter:
+  cooldown_minutes: 120
+  top_n: 10
