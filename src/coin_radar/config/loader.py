@@ -45,18 +45,46 @@ def _env_override(data: dict, prefix: str = "COIN_RADAR") -> dict:
     env_mapping = {
         ("exchange", "name"): f"{prefix}_EXCHANGE_NAME",
         ("exchange", "proxy"): f"{prefix}_EXCHANGE_PROXY",
-        ("dingtalk", "webhook_url"): f"{prefix}_DINGTALK_WEBHOOK",
-        ("dingtalk", "secret"): f"{prefix}_DINGTALK_SECRET",
+        ("dingtalk", "client_id"): f"{prefix}_DINGTALK_CLIENT_ID",
+        ("dingtalk", "client_secret"): f"{prefix}_DINGTALK_CLIENT_SECRET",
+        ("dingtalk", "robot_code"): f"{prefix}_DINGTALK_ROBOT_CODE",
+        ("dingtalk", "open_conversation_id"): f"{prefix}_DINGTALK_OPEN_CONVERSATION_ID",
     }
     for (section, key), env_var in env_mapping.items():
         val = os.environ.get(env_var)
         if val is not None:
             data.setdefault(section, {})[key] = val
+    # Backward compatibility: COIN_RADAR_EXCHANGE_NAME overrides exchanges list
+    exchange_name = os.environ.get(f"{prefix}_EXCHANGE_NAME")
+    exchange_proxy = os.environ.get(f"{prefix}_EXCHANGE_PROXY")
+    if exchange_name or exchange_proxy:
+        if "exchanges" not in data:
+            data["exchanges"] = [{"name": "binance"}]
+        if data["exchanges"]:
+            if exchange_name:
+                data["exchanges"][0]["name"] = exchange_name
+            if exchange_proxy:
+                data["exchanges"][0]["proxy"] = exchange_proxy
     return data
 
 
+def _apply_defaults(exchanges_data: list, defaults: dict) -> list:
+    """为每个交易所配置应用全局默认值，支持优先级覆盖机制"""
+    result = []
+    for exchange in exchanges_data:
+        merged = {}
+        # 先应用默认值
+        for key, value in defaults.items():
+            if value is not None:
+                merged[key] = value
+        # 再应用交易所级别的配置（覆盖默认值）
+        for key, value in exchange.items():
+            merged[key] = value
+        result.append(merged)
+    return result
+
+
 def _build_config(data: dict) -> AppConfig:
-    exchange_data = data.get("exchange", {})
     monitor_data = data.get("monitor", {})
     dingtalk_data = data.get("dingtalk", {})
     filter_data = data.get("filter", {})
@@ -68,13 +96,27 @@ def _build_config(data: dict) -> AppConfig:
     monitor = MonitorConfig(weights=weights, **monitor_fields)
 
     dingtalk_raw = DingTalkConfig(**dingtalk_data)
-    if dingtalk_raw.secret and dingtalk_raw.secret.startswith("gAAAA"):
-        dingtalk_raw.secret = decrypt_value(dingtalk_raw.secret)
-    if dingtalk_raw.webhook_url and dingtalk_raw.webhook_url.startswith("gAAAA"):
-        dingtalk_raw.webhook_url = decrypt_value(dingtalk_raw.webhook_url)
+    if dingtalk_raw.client_secret and dingtalk_raw.client_secret.startswith("gAAAA"):
+        dingtalk_raw.client_secret = decrypt_value(dingtalk_raw.client_secret)
+
+    # 获取全局默认配置
+    defaults = data.get("defaults", {})
+
+    # Parse multi-exchange config, backward compatible with old single-exchange format
+    exchanges_data = data.get("exchanges")
+    if exchanges_data is None and "exchange" in data:
+        exchanges_data = [data["exchange"]]
+    if exchanges_data is None:
+        exchanges_data = [{"name": "binance"}]
+    
+    # 应用全局默认值并支持交易所级别覆盖
+    if defaults:
+        exchanges_data = _apply_defaults(exchanges_data, defaults)
+    
+    exchanges = [ExchangeConfig(**e) for e in exchanges_data]
 
     return AppConfig(
-        exchange=ExchangeConfig(**exchange_data),
+        exchanges=exchanges,
         monitor=monitor,
         dingtalk=dingtalk_raw,
         filter=FilterConfig(**filter_data),

@@ -69,7 +69,9 @@ class MarketDataRepo:
             "  AVG(cvd) AS avg_cvd, "
             "  AVG(long_short_ratio) AS avg_ls_ratio, "
             "  AVG(bid_depth) AS avg_bid_depth, "
-            "  AVG(ask_depth) AS avg_ask_depth "
+            "  AVG(ask_depth) AS avg_ask_depth, "
+            "  MAX(high) AS high_24h, "
+            "  MIN(low) AS low_24h "
             "FROM market_data "
             "WHERE symbol = ? AND exchange = ? AND timestamp >= ?",
             (symbol, exchange, cutoff),
@@ -126,7 +128,7 @@ class CooldownRepo:
         self, symbol: str, module: str, minutes: int
     ) -> None:
         cooldown_until = int(time.time()) + minutes * 60
-        # 先检查是否已有该 symbol+module 的冷却记录
+        # Check if cooldown record already exists for this symbol+module
         cursor = await self._conn.execute(
             "SELECT id FROM cooldowns WHERE symbol = ? AND module = ?",
             (symbol, module),
@@ -153,7 +155,7 @@ class CooldownRepo:
             (symbol, module),
         )
         row = await cursor.fetchone()
-        # 无记录或已过期则表示已冷却
+        # No record or expired means cooled down
         if row is None:
             return True
         return now >= row["cooldown_until"]

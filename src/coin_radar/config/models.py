@@ -32,9 +32,13 @@ class MonitorConfig:
 
 @dataclass
 class DingTalkConfig:
+    client_id: str = ""
+    client_secret: str = ""
+    robot_code: str = ""
+    open_conversation_id: str = ""
     webhook_url: str = ""
-    secret: str = ""
-    at_mobiles: list[str] = field(default_factory=list)
+    at_user_ids: list[str] = field(default_factory=list)
+    at_all: bool = False
 
 
 @dataclass
@@ -45,7 +49,13 @@ class FilterConfig:
 
 @dataclass
 class AppConfig:
-    exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
+    exchanges: list[ExchangeConfig] = field(
+        default_factory=lambda: [ExchangeConfig(name="binance")]
+    )
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     filter: FilterConfig = field(default_factory=FilterConfig)
+
+    @property
+    def exchange_names(self) -> list[str]:
+        return [e.name for e in self.exchanges]

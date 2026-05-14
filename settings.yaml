@@ -1,7 +1,18 @@
-exchange:
-  name: binance
-  proxy: null
+# 全局默认配置
+defaults:
+  proxy: http://127.0.0.1:33210
   timeout: 30
+
+exchanges:
+  - name: binance
+    # 未指定 proxy 和 timeout 时，使用 defaults 中的值
+    timeout: 30
+  - name: okx
+    proxy: null  # 显式设置为 null，不使用全局代理
+    timeout: 30
+  - name: bybit
+    proxy: null # 覆盖全局代理，使用独立代理
+    timeout: 60  # 覆盖全局超时
 
 monitor:
   weights:
@@ -18,9 +29,12 @@ monitor:
   baseline_hours: 12
 
 dingtalk:
-  webhook_url: ""
-  secret: ""
-  at_mobiles: []
+  client_id: ""
+  client_secret: ""
+  robot_code: ""
+  open_conversation_id: ""
+  at_user_ids: []
+  at_all: false
 
 filter:
   cooldown_minutes: 120

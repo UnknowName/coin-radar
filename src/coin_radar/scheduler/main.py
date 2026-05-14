@@ -25,6 +25,15 @@ SCAN_INTERVAL = 300
 CONTRACT_CHECK_INTERVAL = 3600
 
 
+# Common USDT symbols fallback list for major exchanges
+_FALLBACK_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+    "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "TRX/USDT", "LINK/USDT",
+    "MATIC/USDT", "DOT/USDT", "UNI/USDT", "LTC/USDT", "ATOM/USDT",
+    "ETC/USDT", "NEAR/USDT", "XLM/USDT", "BCH/USDT", "FIL/USDT",
+]
+
+
 class Scheduler:
     """Main scheduler: periodically triggers data fetching, monitoring scans, signal filtering, and DingTalk notifications"""
 
@@ -39,7 +48,7 @@ class Scheduler:
         self._signal_filter = SignalFilter(self._db, self._config.filter, self._config.monitor)
         self._notifier = DingTalkNotifier(self._config.dingtalk)
         self._running = False
-        self._symbols: list[str] = []
+        self._symbols_by_exchange: dict[str, list[str]] = {}
 
     async def run(self) -> None:
         """Main execution loop"""
@@ -87,49 +96,86 @@ class Scheduler:
             await self._db.close()
 
     async def _init_symbols(self) -> None:
-        """Fetch symbol list from exchange"""
-        try:
-            adapter = self._fetcher._get_adapter("binance")
-            markets = await adapter.fetch_markets()
-            # Filter for USDT trading pairs
-            self._symbols = [
-                m["symbol"] for m in markets
-                if m["symbol"].endswith("/USDT") and m.get("active", True)
-            ]
-            logger.info("Fetched %d USDT symbols", len(self._symbols))
-        except Exception:
-            logger.exception("Failed to fetch symbol list, using default list")
-            self._symbols = MAJOR_SYMBOLS.copy()
+        """Fetch symbol list from all configured exchanges"""
+        for name in self._config.exchange_names:
+            try:
+                adapter = self._fetcher.get_adapter(name)
+                markets = await adapter.fetch_markets()
+                symbols = [
+                    m["symbol"] for m in markets
+                    if m["symbol"].endswith("/USDT") and m.get("active", True)
+                ]
+                if not symbols:
+                    # Empty symbol list indicates network failure
+                    logger.warning("No symbols fetched from %s (empty list), using fallback", name)
+                    self._symbols_by_exchange[name] = _FALLBACK_SYMBOLS.copy()
+                else:
+                    self._symbols_by_exchange[name] = symbols
+                    logger.info("Fetched %d USDT symbols from %s", len(symbols), name)
+            except Exception as e:
+                logger.exception("Failed to fetch symbols from %s", name)
+                # Use fallback symbols when network fails
+                logger.warning("Using fallback symbol list for %s due to network error", name)
+                self._symbols_by_exchange[name] = _FALLBACK_SYMBOLS.copy()
 
     async def _fetch_data(self) -> None:
-        """Fetch market data for all symbols"""
-        try:
-            await self._fetcher.fetch_all(self._symbols, "binance")
-        except Exception:
-            logger.exception("Data fetch error")
+        """Fetch market data from all exchanges concurrently"""
+        tasks = []
+        exchange_names = []
+        for exchange, symbols in self._symbols_by_exchange.items():
+            tasks.append(self._fetcher.fetch_all(symbols, exchange))
+            exchange_names.append(exchange)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for name, result in zip(exchange_names, results):
+            if isinstance(result, Exception):
+                logger.exception("Data fetch error for %s", name)
 
     async def _run_monitors(self) -> list[Signal]:
-        """Run four monitor modules in parallel"""
-        # Altcoin and ratio scans use full list (excluding major coins)
-        alt_symbols = [s for s in self._symbols if s not in MAJOR_SYMBOLS]
+        """Run monitor modules on all exchanges concurrently and aggregate signals"""
+        monitor_tasks = []
+        exchange_keys = []
+        for exchange, symbols in self._symbols_by_exchange.items():
+            alt_symbols = [s for s in symbols if s not in MAJOR_SYMBOLS]
+            monitor_tasks.append(
+                self._run_exchange_monitors(exchange, alt_symbols, symbols)
+            )
+            exchange_keys.append(exchange)
 
-        alt_signals, major_signals, ratio_signals = await asyncio.gather(
-            self._altcoin_scanner.scan(alt_symbols, "binance"),
-            self._major_alert.scan(MAJOR_SYMBOLS, "binance"),
-            self._perp_spot.scan(self._symbols, "binance"),
-        )
-
-        all_signals = alt_signals + major_signals + ratio_signals
-        logger.info(
-            "Monitor results: altcoins %d, majors %d, ratio %d",
-            len(alt_signals), len(major_signals), len(ratio_signals),
-        )
+        results = await asyncio.gather(*monitor_tasks, return_exceptions=True)
+        all_signals: list[Signal] = []
+        for name, result in zip(exchange_keys, results):
+            if isinstance(result, Exception):
+                logger.exception("Monitor error for %s", name)
+            else:
+                all_signals.extend(result)
         return all_signals
 
+    async def _run_exchange_monitors(
+        self, exchange: str, alt_symbols: list[str], all_symbols: list[str]
+    ) -> list[Signal]:
+        """Run three monitor modules on a single exchange"""
+        logger.info(
+            "[%s] Symbol split: total=%d | majors=%d(%s) | altcoins=%d",
+            exchange, len(all_symbols),
+            len(MAJOR_SYMBOLS), ",".join(MAJOR_SYMBOLS), len(alt_symbols),
+        )
+        alt_signals, major_signals, ratio_signals = await asyncio.gather(
+            self._altcoin_scanner.scan(alt_symbols, exchange),
+            self._major_alert.scan(MAJOR_SYMBOLS, exchange),
+            self._perp_spot.scan(all_symbols, exchange),
+        )
+        logger.info(
+            "[%s] Monitor results: altcoins %d, majors %d, ratio %d",
+            exchange, len(alt_signals), len(major_signals), len(ratio_signals),
+        )
+        return alt_signals + major_signals + ratio_signals
+
     async def _check_new_contracts(self) -> None:
-        """Detect new contracts"""
+        """Detect new contracts (requirement 3.2.3.1 only for Binance)"""
         try:
-            adapter = self._fetcher._get_adapter("binance")
+            # Prefer binance, if not configured use first exchange
+            contract_exchange = "binance" if "binance" in self._config.exchange_names else self._config.exchange_names[0]
+            adapter = self._fetcher.get_adapter(contract_exchange)
             new_signals = await self._new_contract.detect(adapter)
             if new_signals:
                 filtered = await self._signal_filter.filter(new_signals)
@@ -138,16 +184,47 @@ class Scheduler:
             logger.exception("New contract detection error")
 
     async def _push_signals(self, signals: list[Signal]) -> None:
-        """Push signals to DingTalk"""
+        """Push signals to DingTalk in batch, with fallback notification on failure"""
+        if not signals:
+            return
+
+        try:
+            result = await self._notifier.send_signals_batch(signals)
+            if result.get("errcode") == 0:
+                sent_count = result.get("sent_count", len(signals))
+                logger.info("Batch push success: %d signals sent", sent_count)
+            else:
+                logger.warning("Batch push failed: %s", result)
+                await self._fallback_notify(signals, result.get("errmsg", "unknown error"))
+        except Exception as e:
+            logger.exception("Batch push error")
+            await self._fallback_notify(signals, str(e))
+
+    async def _fallback_notify(self, signals: list[Signal], error_msg: str) -> None:
+        # 备用通知机制：控制台高亮输出 + 写入本地通知日志文件
+        logger.warning("=== Fallback notification (DingTalk failed: %s) ===", error_msg)
         for s in signals:
-            try:
-                result = await self._notifier.send_signal(s)
-                if result.get("errcode") == 0:
-                    logger.info("Push success: [%s] %s", s.module, s.symbol)
-                else:
-                    logger.warning("Push failed: [%s] %s - %s", s.module, s.symbol, result)
-            except Exception:
-                logger.exception("Push error: [%s] %s", s.module, s.symbol)
+            logger.warning(
+                "[FALLBACK] %s | %s | score=%.0f | priority=%s | price=%s",
+                s.module, s.symbol, s.score, s.priority,
+                f"{s.price:.2f}" if s.price else "N/A",
+            )
+        try:
+            import os
+            log_dir = os.path.expanduser("~/.coin_radar")
+            os.makedirs(log_dir, exist_ok=True)
+            fallback_path = os.path.join(log_dir, "fallback_notifications.log")
+            with open(fallback_path, "a", encoding="utf-8") as f:
+                import datetime
+                ts = datetime.datetime.now().isoformat()
+                f.write(f"\n[{ts}] DingTalk failed: {error_msg}\n")
+                for s in signals:
+                    f.write(
+                        f"  {s.module} | {s.symbol} | score={s.score:.0f} | "
+                        f"priority={s.priority} | price={s.price}\n"
+                    )
+        except Exception:
+            logger.exception("Fallback notification file write failed")
 
     def stop(self) -> None:
         """Stop the scheduler"""

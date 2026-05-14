@@ -5,7 +5,7 @@ import time
 
 
 class TokenBucketRateLimiter:
-    """令牌桶限流器：控制每秒允许的请求数，支持突发流量"""
+    """Token bucket rate limiter: controls requests per second, supports burst traffic"""
 
     def __init__(self, rate: float, capacity: int) -> None:
         self._rate = rate
@@ -21,14 +21,11 @@ class TokenBucketRateLimiter:
         self._last_refill = now
 
     async def acquire(self) -> None:
-        async with self._lock:
-            self._refill()
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            # 计算需要等待的时间
-            wait_time = (1.0 - self._tokens) / self._rate
-        await asyncio.sleep(wait_time)
-        async with self._lock:
-            self._refill()
-            self._tokens -= 1.0
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait_time = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait_time)

@@ -109,7 +109,7 @@ class DatabaseManager:
     @property
     def conn(self) -> aiosqlite.Connection:
         if self._conn is None:
-            raise RuntimeError("数据库未连接，请先调用 connect()")
+            raise RuntimeError("Database not connected, please call connect() first")
         return self._conn
 
     @property

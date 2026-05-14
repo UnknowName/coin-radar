@@ -37,32 +37,50 @@ class SignalFilter:
         return result
 
     def _hard_threshold_filter(self, signals: list[Signal]) -> list[Signal]:
-        """Filter out signals with baseline sample duration less than baseline_hours; None values are kept"""
         baseline = self._monitor_config.baseline_hours
         filtered: list[Signal] = []
         for s in signals:
-            if s.sample_duration_hours is not None and s.sample_duration_hours < baseline:
-                logger.debug(
-                    "Hard threshold filter: %s sample duration %.1fh < %dh",
-                    s.symbol, s.sample_duration_hours, baseline,
+            if s.sample_duration_hours is None:
+                logger.info(
+                    "[SignalFilter] Hard threshold: %s(%s) sample duration unknown, rejected",
+                    s.symbol, s.module,
+                )
+                continue
+            if s.sample_duration_hours < baseline:
+                logger.info(
+                    "[SignalFilter] Hard threshold: %s(%s) sample duration %.1fh < %dh",
+                    s.symbol, s.module, s.sample_duration_hours, baseline,
                 )
                 continue
             filtered.append(s)
+        if len(filtered) < len(signals):
+            logger.info(
+                "[SignalFilter] Hard threshold: %d/%d passed", len(filtered), len(signals),
+            )
         return filtered
 
     def _quality_sort(self, signals: list[Signal]) -> list[Signal]:
-        """Speculation label + score descending + keep top N"""
         for s in signals:
             if s.ratio_current is not None:
                 if s.ratio_current > 10:
                     s.speculation_label = "High speculation"
                 elif s.ratio_current < 0:
                     s.speculation_label = "Low speculation"
+                # 变异系数加分: CV = std/mean, CV低表示币种稳定，异动更有意义
+                if s.ratio_mean is not None and s.ratio_std is not None and s.ratio_mean > 0:
+                    cv = s.ratio_std / s.ratio_mean
+                    if cv < 0.2:
+                        s.score = min(100.0, s.score + 5)
         sorted_signals = sorted(signals, key=lambda s: s.score, reverse=True)
+        if len(sorted_signals) > self._filter_config.top_n:
+            logger.info(
+                "[SignalFilter] Quality sort truncation: keep top %d (total %d), truncated: %s",
+                self._filter_config.top_n, len(sorted_signals),
+                ", ".join(f"{s.symbol}({s.score:.0f})" for s in sorted_signals[self._filter_config.top_n:]),
+            )
         return sorted_signals[: self._filter_config.top_n]
 
     async def _cooldown_filter(self, signals: list[Signal]) -> list[Signal]:
-        """Cooldown mechanism: no duplicate pushes within cooldown period for same symbol and module"""
         cooldown_minutes = self._filter_config.cooldown_minutes
         filtered: list[Signal] = []
         for s in signals:
@@ -72,13 +90,17 @@ class SignalFilter:
                     s.symbol, s.module, cooldown_minutes,
                 )
             else:
-                logger.debug("In cooldown: %s (%s)", s.symbol, s.module)
+                logger.info("[SignalFilter] Cooldown dedup: %s(%s) in cooldown period", s.symbol, s.module)
         return filtered
 
     def _cross_module_dedup(self, signals: list[Signal]) -> list[Signal]:
-        """Keep only highest score signal for same symbol"""
-        seen: dict[str, Signal] = {}
+        seen: list[str] = []
+        deduped: dict[str, Signal] = {}
         for s in signals:
-            if s.symbol not in seen or s.score > seen[s.symbol].score:
-                seen[s.symbol] = s
-        return list(seen.values())
+            if s.symbol not in deduped or s.score > deduped[s.symbol].score:
+                if s.symbol in deduped:
+                    seen.append(f"{s.symbol}({deduped[s.symbol].module}@{deduped[s.symbol].score:.0f}→{s.module}@{s.score:.0f})")
+                deduped[s.symbol] = s
+        if seen:
+            logger.info("[SignalFilter] Cross-module dedup: %s", ", ".join(seen))
+        return list(deduped.values())

@@ -10,24 +10,30 @@ from coin_radar.fetcher.rate_limiter import TokenBucketRateLimiter
 
 logger = logging.getLogger(__name__)
 
-# ccxt 网络错误基类，用于重试判断
+# ccxt network error base class for retry judgment
 _NetworkError = (
     ccxt_async.NetworkError,
     ccxt_async.ExchangeNotAvailable,
     ccxt_async.RequestTimeout,
 )
 
-# 通用重试策略：3次重试，指数退避
+# DNS/connection errors that should be retried
+_DNSError = (
+    ccxt_async.NetworkError,
+    ccxt_async.ExchangeNotAvailable,
+)
+
+# Generic retry strategy: 3 retries, exponential backoff
 _retry_decorator = retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=1, max=10),
-    retry=retry_if_exception_type(_NetworkError),
+    retry=retry_if_exception_type(_NetworkError) | retry_if_exception_type(_DNSError),
     reraise=True,
 )
 
 
 class ExchangeAdapter:
-    """交易所适配器：封装 ccxt 异步调用，内置限流和重试"""
+    """Exchange adapter: wraps ccxt async calls with built-in rate limiting and retry"""
 
     def __init__(self, exchange_id: str, config: ExchangeConfig) -> None:
         self._exchange_id = exchange_id
@@ -35,7 +41,7 @@ class ExchangeAdapter:
 
         exchange_class = getattr(ccxt_async, exchange_id, None)
         if exchange_class is None:
-            raise ValueError(f"不支持的交易所: {exchange_id}")
+            raise ValueError(f"Unsupported exchange: {exchange_id}, available: {[attr for attr in dir(ccxt_async) if not attr.startswith('_')]}")
 
         options: dict = {"timeout": config.timeout * 1000}
         if config.proxy:
@@ -46,11 +52,31 @@ class ExchangeAdapter:
             options["aiohttp_proxy"] = config.proxy
 
         self._exchange: ccxt_async.Exchange = exchange_class(options)
+        logger.info("Initialized exchange adapter: %s", exchange_id)
 
     @_retry_decorator
     async def _call(self, fn, *args, **kwargs):
-        await self._limiter.acquire()
-        return await fn(*args, **kwargs)
+        try:
+            await self._limiter.acquire()
+            return await fn(*args, **kwargs)
+        except _NetworkError as e:
+            # Check if it's a DNS/connection error
+            error_msg = str(e).lower()
+            if 'dns' in error_msg or 'could not contact' in error_msg or 'cannot connect' in error_msg:
+                logger.error(
+                    "DNS/Network error for %s. "
+                    "Possible causes: 1) Network connection issue, "
+                    "2) DNS server problem, or "
+                    "3) Exchange API blocked (may need proxy). "
+                    "Please check network settings or configure a proxy.",
+                    self._exchange_id
+                )
+            else:
+                logger.error("Network error for %s: %s", self._exchange_id, e)
+            raise
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", self._exchange_id, e)
+            raise
 
     async def fetch_ohlcv(
         self, symbol: str, timeframe: str = "5m", limit: int = 100
@@ -58,31 +84,31 @@ class ExchangeAdapter:
         try:
             return await self._call(self._exchange.fetch_ohlcv, symbol, timeframe, limit=limit)
         except Exception:
-            logger.warning("fetch_ohlcv 失败: %s %s", self._exchange_id, symbol)
+            logger.warning("fetch_ohlcv failed: %s %s", self._exchange_id, symbol)
             return None
 
     async def fetch_ticker(self, symbol: str) -> dict | None:
         try:
             return await self._call(self._exchange.fetch_ticker, symbol)
         except Exception:
-            logger.warning("fetch_ticker 失败: %s %s", self._exchange_id, symbol)
+            logger.warning("fetch_ticker failed: %s %s", self._exchange_id, symbol)
             return None
 
     async def fetch_tickers(self, symbols: list[str] | None = None) -> dict | None:
         try:
             return await self._call(self._exchange.fetch_tickers, symbols)
         except Exception:
-            logger.warning("fetch_tickers 失败: %s", self._exchange_id)
+            logger.warning("fetch_tickers failed: %s", self._exchange_id)
             return None
 
     async def fetch_funding_rate(self, symbol: str) -> dict | None:
-        # 仅合约市场支持资金费率
+        # Only futures market supports funding rate
         if not self._exchange.has.get("fetchFundingRate"):
             return None
         try:
             return await self._call(self._exchange.fetch_funding_rate, symbol)
         except Exception:
-            logger.debug("fetch_funding_rate 失败: %s %s", self._exchange_id, symbol)
+            logger.debug("fetch_funding_rate failed: %s %s", self._exchange_id, symbol)
             return None
 
     async def fetch_open_interest(self, symbol: str) -> dict | None:
@@ -91,22 +117,64 @@ class ExchangeAdapter:
         try:
             return await self._call(self._exchange.fetch_open_interest, symbol)
         except Exception:
-            logger.debug("fetch_open_interest 失败: %s %s", self._exchange_id, symbol)
+            logger.debug("fetch_open_interest failed: %s %s", self._exchange_id, symbol)
             return None
 
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict | None:
         try:
             return await self._call(self._exchange.fetch_order_book, symbol, limit)
         except Exception:
-            logger.warning("fetch_order_book 失败: %s %s", self._exchange_id, symbol)
+            logger.warning("fetch_order_book failed: %s %s", self._exchange_id, symbol)
             return None
 
     async def fetch_markets(self) -> list[dict]:
         try:
             return await self._call(self._exchange.fetch_markets)
         except Exception:
-            logger.warning("fetch_markets 失败: %s", self._exchange_id)
+            logger.error("fetch_markets failed: %s", self._exchange_id)
             return []
+
+    async def fetch_perp_ticker(self, symbol: str) -> dict | None:
+        # 获取永续合约行情（用于 CVD 和永续成交量）
+        if ':' in symbol:
+            perp_symbol = symbol
+        else:
+            perp_symbol = symbol + ':USDT'
+        try:
+            return await self._call(self._exchange.fetch_ticker, perp_symbol)
+        except Exception:
+            logger.debug("fetch_perp_ticker failed: %s %s", self._exchange_id, symbol)
+            return None
+
+    async def fetch_long_short_ratio(self, symbol: str) -> list | None:
+        # 获取全局多空比（Binance 专用 API）
+        method_name = 'fapiPublicGetGlobalLongShortAccountRatio'
+        if not hasattr(self._exchange, method_name):
+            return None
+        try:
+            pair = symbol.replace('/', '').replace(':', '')
+            return await self._call(
+                getattr(self._exchange, method_name),
+                {'symbol': pair, 'period': '5m', 'limit': 1},
+            )
+        except Exception:
+            logger.debug("fetch_long_short_ratio failed: %s %s", self._exchange_id, symbol)
+            return None
+
+    async def fetch_top_trader_long_short_ratio(self, symbol: str) -> list | None:
+        # 获取大户多空比（Binance 专用 API）
+        method_name = 'fapiPublicGetTopLongShortAccountRatio'
+        if not hasattr(self._exchange, method_name):
+            return None
+        try:
+            pair = symbol.replace('/', '').replace(':', '')
+            return await self._call(
+                getattr(self._exchange, method_name),
+                {'symbol': pair, 'period': '5m', 'limit': 1},
+            )
+        except Exception:
+            logger.debug("fetch_top_trader_long_short_ratio failed: %s %s", self._exchange_id, symbol)
+            return None
 
     async def close(self) -> None:
         await self._exchange.close()

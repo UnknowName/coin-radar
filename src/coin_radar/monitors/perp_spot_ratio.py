@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import math
 
 from coin_radar.config.models import MonitorConfig
 from coin_radar.db.database import DatabaseManager
+from coin_radar.monitors.altcoin_scanner import _calc_rsi, _calc_resistance_support
 from coin_radar.notifiers.formatter import Signal
 
 _LOOKBACK_HOURS = 7 * 24
 _MIN_SAMPLES = 2
+
+logger = logging.getLogger(__name__)
 
 
 class PerpSpotRatioMonitor:
@@ -26,9 +30,9 @@ class PerpSpotRatioMonitor:
     async def _check_symbol(self, symbol: str, exchange: str) -> Signal | None:
         rows = await self._db.market_data.get_recent(symbol, exchange, _LOOKBACK_HOURS)
         if len(rows) < _MIN_SAMPLES:
+            logger.debug("[%s] Skip: insufficient data points (%d<%d)", symbol, len(rows), _MIN_SAMPLES)
             return None
 
-        # Calculate perp_volume / spot_volume ratio for each row, skip invalid data points
         ratios: list[float] = []
         for row in rows:
             if not row.spot_volume or row.spot_volume <= 0:
@@ -37,26 +41,34 @@ class PerpSpotRatioMonitor:
                 continue
             ratios.append(row.perp_volume / row.spot_volume)
 
-        # Insufficient valid data points to calculate statistics
         if len(ratios) < _MIN_SAMPLES:
+            logger.debug("[%s] Skip: insufficient valid ratios (%d<%d)", symbol, len(ratios), _MIN_SAMPLES)
             return None
 
-        # Calculate mean and standard deviation
         mean = sum(ratios) / len(ratios)
         variance = sum((r - mean) ** 2 for r in ratios) / len(ratios)
         std = math.sqrt(variance)
 
-        # Standard deviation is 0, cannot calculate z-score as all ratios are identical
         if std == 0:
+            logger.debug("[%s] Skip: std dev is 0 (all ratios identical=%.2f)", symbol, mean)
             return None
 
-        # Current ratio uses the latest valid data point
         current_ratio = ratios[0]
         z_score = (current_ratio - mean) / std
 
-        # |z-score| does not exceed threshold, no alert triggered
         if abs(z_score) <= self._config.z_score_threshold:
+            logger.info(
+                "[%s] Perp/spot ratio: z=%.2f(threshold=%.1f) | ratio=%.2f mean=%.2f std=%.4f | below threshold",
+                symbol, z_score, self._config.z_score_threshold,
+                current_ratio, mean, std,
+            )
             return None
+
+        logger.info(
+            "[%s] Perp/spot ratio: z=%.2f(threshold=%.1f) | ratio=%.2f mean=%.2f std=%.4f | triggered!",
+            symbol, z_score, self._config.z_score_threshold,
+            current_ratio, mean, std,
+        )
 
         # Score: z=3→60, z=5→100, capped at 100
         score = min(100.0, abs(z_score) * 20)
@@ -80,6 +92,13 @@ class PerpSpotRatioMonitor:
         if len(rows) >= 2 and rows[-1].close > 0:
             change_24h = (latest.close - rows[-1].close) / rows[-1].close * 100
 
+        # 计算技术指标
+        closes = [r.close for r in rows]
+        highs = [r.high for r in rows]
+        lows = [r.low for r in rows]
+        rsi_14 = _calc_rsi(closes)
+        resistance, support = _calc_resistance_support(highs, lows)
+
         return Signal(
             module="Perp/Swap Ratio Anomaly",
             symbol=symbol,
@@ -91,6 +110,9 @@ class PerpSpotRatioMonitor:
             price=latest.close,
             change_24h=change_24h,
             volume=latest.volume,
+            rsi_14=rsi_14,
+            resistance=resistance,
+            support=support,
             ratio_current=current_ratio,
             ratio_mean=mean,
             ratio_std=std,

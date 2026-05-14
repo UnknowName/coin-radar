@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 
 from coin_radar.config.models import MonitorConfig
@@ -7,7 +8,8 @@ from coin_radar.db.database import DatabaseManager
 from coin_radar.db.models import MarketDataRow
 from coin_radar.notifiers.formatter import Signal
 
-_MODULE = "山寨币异动"
+_MODULE = "Altcoin Movement"
+logger = logging.getLogger(__name__)
 
 
 def _linear_score(value: float, full_point: float) -> float:
@@ -16,6 +18,35 @@ def _linear_score(value: float, full_point: float) -> float:
     if value >= full_point:
         return 100.0
     return value / full_point * 100.0
+
+
+def _calc_rsi(closes: list[float], period: int = 14) -> float | None:
+    # RSI(14): 使用 Wilder 平滑法计算相对强弱指标
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i + 1] for i in range(len(closes) - 1)]
+    gains = [d if d > 0 else 0.0 for d in deltas[:period]]
+    losses = [-d if d < 0 else 0.0 for d in deltas[:period]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    for delta in deltas[period:]:
+        gain = delta if delta > 0 else 0.0
+        loss = -delta if delta < 0 else 0.0
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _calc_resistance_support(highs: list[float], lows: list[float]) -> tuple[float | None, float | None]:
+    # 阻力位/支撑位: 使用近期高/低点枢轴点计算
+    if not highs or not lows:
+        return None, None
+    resistance = max(highs)
+    support = min(lows)
+    return resistance, support
 
 
 class AltcoinScanner:
@@ -27,6 +58,7 @@ class AltcoinScanner:
         signals = []
         for symbol in symbols:
             if not await self._db.cooldowns.is_cooled_down(symbol, _MODULE):
+                logger.debug("[%s] Skip: in cooldown period", symbol)
                 continue
             signal = await self._score_symbol(symbol, exchange)
             if signal is not None:
@@ -39,6 +71,7 @@ class AltcoinScanner:
     async def _score_symbol(self, symbol: str, exchange: str) -> Signal | None:
         recent = await self._db.market_data.get_recent(symbol, exchange, hours=1)
         if not recent:
+            logger.debug("[%s] Skip: no market data in last 1h", symbol)
             return None
         latest = recent[0]
 
@@ -50,16 +83,16 @@ class AltcoinScanner:
 
         extended_stats = {**stats_24h, "avg_vp_ratio_7d": avg_vp_ratio}
 
-        s1 = self._score_silent_accumulation(recent, extended_stats)
-        s2 = self._score_cvd_anomaly(latest.cvd, cvd_mean, cvd_std)
-        s3 = self._score_oi_price_stable(
+        s1, r1 = self._score_silent_accumulation(recent, extended_stats)
+        s2, r2 = self._score_cvd_anomaly(latest.cvd, cvd_mean, cvd_std)
+        s3, r3 = self._score_oi_price_stable(
             latest.open_interest, latest.close, old_oi, old_price
         )
-        s4 = self._score_whale_divergence(
+        s4, r4 = self._score_whale_divergence(
             latest.top_trader_long_short_ratio, latest.long_short_ratio
         )
-        s5 = self._score_funding_divergence(change_24h, latest.funding_rate)
-        s6 = self._score_liquidity_thinning(
+        s5, r5 = self._score_funding_divergence(change_24h, latest.funding_rate)
+        s6, r6 = self._score_liquidity_thinning(
             latest.bid_depth, latest.ask_depth,
             stats_24h.get("avg_bid_depth"), stats_24h.get("avg_ask_depth"),
         )
@@ -74,6 +107,12 @@ class AltcoinScanner:
             + s6 * w.liquidity_thinning
         )
 
+        logger.info(
+            "[%s] Scoring: total=%.1f(threshold=%.0f) | silent_accum=%.1f(%s) | cvd_anom=%.1f(%s) | oi_price_stable=%.1f(%s) | whale_div=%.1f(%s) | funding_div=%.1f(%s) | liq_thin=%.1f(%s)",
+            symbol, total, self._config.score_threshold,
+            s1, r1, s2, r2, s3, r3, s4, r4, s5, r5, s6, r6,
+        )
+
         if total < self._config.score_threshold:
             return None
 
@@ -85,7 +124,26 @@ class AltcoinScanner:
 
         direction = None
         if latest.cvd is not None:
-            direction = "多头主导" if latest.cvd > 0 else "空头主导"
+            direction = "Bullish" if latest.cvd > 0 else "Bearish"
+
+        # 计算样本时长：从数据库中最早记录到最新记录的时间跨度
+        sample_duration_hours = None
+        oldest_ts = await self._db.market_data.get_oldest_timestamp(symbol, exchange)
+        if oldest_ts is not None:
+            sample_duration_hours = (latest.timestamp - oldest_ts) / 3600
+
+        # 计算技术指标
+        closes = [r.close for r in recent]
+        highs = [r.high for r in recent]
+        lows = [r.low for r in recent]
+        rsi_14 = _calc_rsi(closes)
+        resistance, support = _calc_resistance_support(highs, lows)
+
+        # 1h量倍数: 当前1h成交量 / 24h平均成交量
+        volume_1h_multiple = None
+        avg_volume = stats_24h.get("avg_volume")
+        if avg_volume and avg_volume > 0 and latest.volume:
+            volume_1h_multiple = latest.volume / avg_volume
 
         return Signal(
             module=_MODULE,
@@ -98,6 +156,11 @@ class AltcoinScanner:
             change_24h=change_24h,
             volume=latest.volume,
             open_interest=latest.open_interest,
+            rsi_14=rsi_14,
+            resistance=resistance,
+            support=support,
+            volume_1h_multiple=volume_1h_multiple,
+            sample_duration_hours=sample_duration_hours,
             details={
                 "silent_accumulation": round(s1, 2),
                 "cvd_anomaly": round(s2, 2),
@@ -110,45 +173,50 @@ class AltcoinScanner:
 
     def _score_silent_accumulation(
         self, data: list[MarketDataRow], stats_24h: dict
-    ) -> float:
+    ) -> tuple[float, str]:
         if not data:
-            return 0.0
+            return 0.0, "No data"
+
+        # 需求3.2.1.1: 24小时价格波动小于5%
+        high_24h = stats_24h.get("high_24h")
+        low_24h = stats_24h.get("low_24h")
+        if high_24h is None or low_24h is None:
+            return 0.0, "24h high/low data missing"
+        if low_24h <= 0:
+            return 0.0, "24h low price <= 0"
+
+        volatility_24h = (high_24h - low_24h) / low_24h
+        if volatility_24h >= 0.05:
+            return 0.0, f"24h Volatility {volatility_24h:.1%} > 5%"
+
+        # 5分钟"成交量/价格变动"突然飙升
         latest = data[0]
-        if latest.low <= 0:
-            return 0.0
-
-        # 24h价格波动率
-        volatility = (latest.high - latest.low) / latest.low
-        if volatility >= 0.05:
-            return 0.0
-
-        # 5min成交量/价格变动比值
         price_change = abs(latest.close - latest.open)
         if price_change == 0:
-            # 价格无变动但有成交量，强烈吸筹信号
-            return 100.0 if latest.volume > 0 else 0.0
+            if latest.volume > 0:
+                return 100.0, "Price unchanged but volume present"
+            return 0.0, "No price or volume change"
 
         current_vp_ratio = latest.volume / price_change
 
-        # 7日vp_ratio均值
         avg_vp_ratio = stats_24h.get("avg_vp_ratio_7d")
         if not avg_vp_ratio or avg_vp_ratio <= 0:
-            return 0.0
+            return 0.0, "No 7-day avg VP ratio"
 
-        # 偏离倍数 = 当前/均值 - 1；偏离2倍(当前=3倍均值)得100，1倍(当前=2倍均值)得50
         excess = current_vp_ratio / avg_vp_ratio - 1
-        return _linear_score(excess, 2.0)
+        score = _linear_score(excess, 2.0)
+        return score, f"Deviation {excess:.1%}"
 
     def _score_cvd_anomaly(
         self, current_cvd: float | None, mean: float | None, std: float | None
-    ) -> float:
+    ) -> tuple[float, str]:
         if current_cvd is None or mean is None or std is None or std <= 0:
-            return 0.0
+            return 0.0, "CVD data incomplete"
         z = (current_cvd - mean) / std
         if z <= 0:
-            return 0.0
-        # z_score >= 2得100，>= 1得50，线性插值
-        return _linear_score(z, 2.0)
+            return 0.0, f"z={z:.2f}<=0 (not bullish)"
+        score = _linear_score(z, 2.0)
+        return score, f"z={z:.2f}"
 
     def _score_oi_price_stable(
         self,
@@ -156,43 +224,39 @@ class AltcoinScanner:
         current_price: float,
         old_oi: float | None,
         old_price: float | None,
-    ) -> float:
+    ) -> tuple[float, str]:
         if current_oi is None or old_oi is None or old_oi <= 0:
-            return 0.0
+            return 0.0, "OI data missing"
         if old_price is None or old_price <= 0:
-            return 0.0
+            return 0.0, "4h ago price missing"
 
-        # 价格变动率超过3%则不符合"价格平稳"
         price_change = abs(current_price - old_price) / old_price
         if price_change >= 0.03:
-            return 0.0
+            return 0.0, f"Price change {price_change:.1%} >= 3%"
 
-        # OI增长率：>= 10%得100，>= 5%得50
         oi_growth = (current_oi - old_oi) / old_oi
-        return _linear_score(oi_growth, 0.10)
+        score = _linear_score(oi_growth, 0.10)
+        return score, f"Price change {price_change:.1%}, OI growth {oi_growth:.1%}"
 
     def _score_whale_divergence(
         self, top_ratio: float | None, all_ratio: float | None
-    ) -> float:
+    ) -> tuple[float, str]:
         if top_ratio is None or all_ratio is None:
-            return 0.0
-        # 背离度 = 大户多空比与全体多空比之差
+            return 0.0, "Whale/retail long-short ratio data missing"
         divergence = abs(top_ratio - all_ratio)
-        # 背离度 >= 0.3得100，>= 0.15得50
-        return _linear_score(divergence, 0.30)
+        score = _linear_score(divergence, 0.30)
+        return score, f"Divergence={divergence:.3f}"
 
     def _score_funding_divergence(
         self, change_24h: float | None, funding_rate: float | None
-    ) -> float:
+    ) -> tuple[float, str]:
         if change_24h is None or funding_rate is None:
-            return 0.0
-        # 价格上涨但资金费率为负 → 空头付费维持，看涨信号
+            return 0.0, "Price change or funding rate data missing"
         if change_24h > 0 and funding_rate < 0:
-            return 100.0
-        # 价格下跌但资金费率为正 → 多头付费维持，看跌信号
+            return 100.0, f"Up {change_24h:.1f}% + rate {funding_rate:.4f} (bullish divergence)"
         if change_24h < 0 and funding_rate > 0:
-            return 100.0
-        return 0.0
+            return 100.0, f"Down {change_24h:.1f}% + rate {funding_rate:.4f} (bearish divergence)"
+        return 0.0, f"Change {change_24h:.1f}% + rate {funding_rate:.4f} (no divergence)"
 
     def _score_liquidity_thinning(
         self,
@@ -200,20 +264,19 @@ class AltcoinScanner:
         ask_depth: float | None,
         avg_bid: float | None,
         avg_ask: float | None,
-    ) -> float:
+    ) -> tuple[float, str]:
         if bid_depth is None or ask_depth is None or avg_bid is None or avg_ask is None:
-            return 0.0
+            return 0.0, "Depth data missing"
         current_depth = bid_depth + ask_depth
         avg_depth = avg_bid + avg_ask
         if avg_depth <= 0:
-            return 0.0
+            return 0.0, "Avg depth <= 0"
 
-        # 下降比 = (均值 - 当前) / 均值
         drop_ratio = (avg_depth - current_depth) / avg_depth
         if drop_ratio <= 0:
-            return 0.0
-        # 下降比 >= 30%得100，>= 15%得50
-        return _linear_score(drop_ratio, 0.30)
+            return 0.0, f"Depth not thinned (drop ratio={drop_ratio:.1%})"
+        score = _linear_score(drop_ratio, 0.30)
+        return score, f"Depth dropped {drop_ratio:.1%}"
 
     async def _get_7day_cvd_stats(
         self, symbol: str, exchange: str
