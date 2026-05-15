@@ -5,6 +5,7 @@ import logging
 import signal
 import time
 
+from coin_radar.async_utils import cleanup_event_loop
 from coin_radar.config.loader import load_config
 from coin_radar.config.models import AppConfig
 from coin_radar.db.database import DatabaseManager
@@ -53,8 +54,8 @@ class Scheduler:
     async def run(self) -> None:
         """Main execution loop"""
         self._running = True
-        await self._db.connect()
         try:
+            await self._db.connect()
             await self._init_symbols()
             await self._check_new_contracts()
 
@@ -239,17 +240,14 @@ def main() -> None:
 
     scheduler = Scheduler(config)
 
-    # Graceful shutdown (Windows doesn't support add_signal_handler, use try-except for Ctrl+C)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        # Unix/Linux: register signal handlers
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, scheduler.stop)
             except (NotImplementedError, OSError):
-                # Windows doesn't support add_signal_handler, rely on KeyboardInterrupt
                 pass
 
         loop.run_until_complete(scheduler.run())
@@ -257,11 +255,7 @@ def main() -> None:
         logger.info("Received interrupt signal, stopping scheduler...")
         scheduler.stop()
     finally:
-        # Cleanup
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
+        cleanup_event_loop(loop)
 
 
 if __name__ == "__main__":

@@ -137,6 +137,7 @@ class DataFetcher:
         self._adapters: dict[str, ExchangeAdapter] = {}
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
         self._symbol_semaphore = asyncio.Semaphore(_PER_SYMBOL_CONCURRENCY)
+        self._closed = False
         self._init_adapters()
 
     def _init_adapters(self) -> None:
@@ -201,5 +202,11 @@ class DataFetcher:
         return result
 
     async def close(self) -> None:
-        for adapter in self._adapters.values():
-            await adapter.close()
+        if self._closed:
+            return
+        self._closed = True
+        for name, adapter in self._adapters.items():
+            try:
+                await adapter.close()
+            except Exception:
+                logger.exception("Failed to close adapter: %s", name)

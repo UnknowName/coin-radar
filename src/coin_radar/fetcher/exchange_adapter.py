@@ -45,6 +45,7 @@ class ExchangeAdapter:
     def __init__(self, exchange_id: str, config: ExchangeConfig) -> None:
         self._exchange_id = exchange_id
         self._limiter = TokenBucketRateLimiter(rate=10.0, capacity=20)
+        self._closed = False
 
         exchange_class = getattr(ccxt_async, exchange_id, None)
         if exchange_class is None:
@@ -183,4 +184,18 @@ class ExchangeAdapter:
             return None
 
     async def close(self) -> None:
-        await self._exchange.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._exchange.close()
+        except Exception:
+            logger.exception("Failed to close exchange: %s", self._exchange_id)
+        # 额外确保 aiohttp ClientSession 被关闭
+        # ccxt 的 close() 有时未能完全关闭 session（如 Throttler 异常时）
+        session = getattr(self._exchange, 'session', None)
+        if session and not session.closed:
+            try:
+                await session.close()
+            except Exception:
+                pass
