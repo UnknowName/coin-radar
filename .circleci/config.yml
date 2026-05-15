@@ -6,8 +6,8 @@ executors:
     docker:
       - image: cimg/python:3.14-node
     environment:
-      AWS_REGION: ap-southeast-1
-      AWS_DEFAULT_REGION: ap-southeast-1
+      AWS_REGION: ap-northeast-2
+      AWS_DEFAULT_REGION: ap-northeast-2
 
 jobs:
   run:
@@ -19,12 +19,12 @@ jobs:
           name: Setup environment
           command: |
             curl https://ipconfig.io
-            echo "Setting up environment for Asia Pacific region..."
+            echo "Setting up environment for Korea region..."
             pip install uv
       - run:
           name: Run application
           command: |
-            echo "Running on non-US region (Asia Pacific - Singapore)..."
+            echo "Running on non-US region (Korea - Seoul)..."
             uv run python main.py
 
 workflows:
