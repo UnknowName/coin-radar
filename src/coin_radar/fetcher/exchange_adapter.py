@@ -35,6 +35,13 @@ _retry_decorator = retry(
 class ExchangeAdapter:
     """Exchange adapter: wraps ccxt async calls with built-in rate limiting and retry"""
 
+    @staticmethod
+    def _to_perp_symbol(symbol: str) -> str:
+        # 现货格式 BTC/USDT → 永续合约格式 BTC/USDT:USDT
+        if ':' in symbol:
+            return symbol
+        return symbol + ':USDT'
+
     def __init__(self, exchange_id: str, config: ExchangeConfig) -> None:
         self._exchange_id = exchange_id
         self._limiter = TokenBucketRateLimiter(rate=10.0, capacity=20)
@@ -102,11 +109,12 @@ class ExchangeAdapter:
             return None
 
     async def fetch_funding_rate(self, symbol: str) -> dict | None:
-        # Only futures market supports funding rate
         if not self._exchange.has.get("fetchFundingRate"):
             return None
+        # 资金费率仅适用于永续合约，需将现货格式转为合约格式
+        perp_symbol = self._to_perp_symbol(symbol)
         try:
-            return await self._call(self._exchange.fetch_funding_rate, symbol)
+            return await self._call(self._exchange.fetch_funding_rate, perp_symbol)
         except Exception:
             logger.debug("fetch_funding_rate failed: %s %s", self._exchange_id, symbol)
             return None
@@ -114,8 +122,10 @@ class ExchangeAdapter:
     async def fetch_open_interest(self, symbol: str) -> dict | None:
         if not self._exchange.has.get("fetchOpenInterest"):
             return None
+        # 持仓量仅适用于永续合约，需将现货格式转为合约格式
+        perp_symbol = self._to_perp_symbol(symbol)
         try:
-            return await self._call(self._exchange.fetch_open_interest, symbol)
+            return await self._call(self._exchange.fetch_open_interest, perp_symbol)
         except Exception:
             logger.debug("fetch_open_interest failed: %s %s", self._exchange_id, symbol)
             return None
@@ -135,11 +145,7 @@ class ExchangeAdapter:
             return []
 
     async def fetch_perp_ticker(self, symbol: str) -> dict | None:
-        # 获取永续合约行情（用于 CVD 和永续成交量）
-        if ':' in symbol:
-            perp_symbol = symbol
-        else:
-            perp_symbol = symbol + ':USDT'
+        perp_symbol = self._to_perp_symbol(symbol)
         try:
             return await self._call(self._exchange.fetch_ticker, perp_symbol)
         except Exception:
