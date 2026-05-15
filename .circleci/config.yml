@@ -1,16 +1,24 @@
 # CircleCI configuration - Skip all tests and run directly
+# Running on non-US region (Asia Pacific)
 version: 2.1
+
+executors:
+  non-us-executor:
+    machine:
+      image: cimg/python:3.14-node
+      aws_region: ap-southeast-1  # 新加坡区域（亚太区，非美国）
+
 jobs:
   run:
-    docker:
-      - image: cimg/python:3.14-node
+    executor: non-us-executor
     steps:
       - checkout
       - run:
           name: Run application
           command: |
-            echo "Skipping tests, running application directly..."
+            echo "Running on non-US region (Asia Pacific - Singapore)..."
             uv run python main.py
+
 workflows:
   run-workflow:
     jobs:
