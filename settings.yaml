@@ -1,6 +1,6 @@
 # 全局默认配置
 defaults:
-  proxy: http://127.0.0.1:33210
+  proxy: null
   timeout: 30
 
 exchanges:
