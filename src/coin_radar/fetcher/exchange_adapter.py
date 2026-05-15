@@ -23,10 +23,10 @@ _DNSError = (
     ccxt_async.ExchangeNotAvailable,
 )
 
-# Generic retry strategy: 3 retries, exponential backoff
+# Generic retry strategy: 5 retries, exponential backoff with jitter
 _retry_decorator = retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=1, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=2, max=30),
     retry=retry_if_exception_type(_NetworkError) | retry_if_exception_type(_DNSError),
     reraise=True,
 )

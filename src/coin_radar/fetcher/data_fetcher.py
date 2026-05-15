@@ -12,8 +12,8 @@ from coin_radar.fetcher.exchange_adapter import ExchangeAdapter
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONCURRENCY = 50  # Maximum concurrent symbols across all exchanges
-_PER_SYMBOL_CONCURRENCY = 2  # Maximum concurrent API calls per symbol
+_MAX_CONCURRENCY = 20  # Maximum concurrent symbols across all exchanges (reduced from 50 to avoid connection floods)
+_PER_SYMBOL_CONCURRENCY = 1  # Maximum concurrent API calls per symbol (reduced from 2 to serialize requests)
 
 
 def _safe_float(value) -> float | None:
@@ -156,14 +156,22 @@ class DataFetcher:
     async def fetch_single(self, symbol: str, exchange: str = "binance") -> FetchResult:
         adapter = self._get_adapter(exchange)
         async with self._semaphore:
-            ohlcv = await adapter.fetch_ohlcv(symbol, timeframe="5m", limit=100)
-            ticker = await adapter.fetch_ticker(symbol)
-            funding_rate = await adapter.fetch_funding_rate(symbol)
-            open_interest = await adapter.fetch_open_interest(symbol)
-            order_book = await adapter.fetch_order_book(symbol)
-            perp_ticker = await adapter.fetch_perp_ticker(symbol)
-            ls_data = await adapter.fetch_long_short_ratio(symbol)
-            top_data = await adapter.fetch_top_trader_long_short_ratio(symbol)
+            async with self._symbol_semaphore:
+                ohlcv = await adapter.fetch_ohlcv(symbol, timeframe="5m", limit=100)
+            async with self._symbol_semaphore:
+                ticker = await adapter.fetch_ticker(symbol)
+            async with self._symbol_semaphore:
+                funding_rate = await adapter.fetch_funding_rate(symbol)
+            async with self._symbol_semaphore:
+                open_interest = await adapter.fetch_open_interest(symbol)
+            async with self._symbol_semaphore:
+                order_book = await adapter.fetch_order_book(symbol)
+            async with self._symbol_semaphore:
+                perp_ticker = await adapter.fetch_perp_ticker(symbol)
+            async with self._symbol_semaphore:
+                ls_data = await adapter.fetch_long_short_ratio(symbol)
+            async with self._symbol_semaphore:
+                top_data = await adapter.fetch_top_trader_long_short_ratio(symbol)
         return FetchResult(
             symbol=symbol,
             exchange=exchange,

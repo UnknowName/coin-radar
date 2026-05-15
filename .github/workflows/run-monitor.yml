@@ -1,0 +1,111 @@
+name: Run Coin Radar Monitor
+
+on:
+  schedule:
+    # 每天 UTC 00:00 运行一次（调试阶段）
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # 允许手动触发
+    inputs:
+      debug_mode:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          uv sync
+
+      - name: Setup configuration
+        run: |
+          # 创建配置目录
+          mkdir -p ~/.coin_radar
+          
+          # 从 secrets 创建 settings.yaml
+          cat > ~/.coin_radar/settings.yaml << EOF
+          # 全局默认配置
+          defaults:
+            proxy: ${{ secrets.PROXY_URL || '' }}
+            timeout: 30
+
+          exchanges:
+            - name: binance
+              proxy: ${{ secrets.BINANCE_PROXY || secrets.PROXY_URL || '' }}
+              timeout: 30
+            - name: okx
+              proxy: ${{ secrets.OKX_PROXY || secrets.PROXY_URL || '' }}
+              timeout: 30
+            - name: bybit
+              proxy: ${{ secrets.BYBIT_PROXY || secrets.PROXY_URL || '' }}
+              timeout: 60
+
+          monitor:
+            weights:
+              silent_accumulation: 0.25
+              cvd_anomaly: 0.20
+              oi_price_stable: 0.20
+              whale_divergence: 0.20
+              funding_divergence: 0.10
+              liquidity_thinning: 0.05
+            score_threshold: 60.0
+            high_priority_threshold: 80.0
+            dedup_minutes: 30
+            z_score_threshold: 3.0
+            baseline_hours: 12
+
+          dingtalk:
+            client_id: ${{ secrets.DINGTALK_CLIENT_ID }}
+            client_secret: ${{ secrets.DINGTALK_CLIENT_SECRET }}
+            robot_code: ${{ secrets.DINGTALK_ROBOT_CODE }}
+            open_conversation_id: ${{ secrets.DINGTALK_CONVERSATION_ID }}
+            at_user_ids: []
+            at_all: false
+
+          filter:
+            cooldown_minutes: 120
+            top_n: 10
+          EOF
+
+      - name: Run Coin Radar Monitor
+        run: |
+          echo "Starting Coin Radar Monitor..."
+          if [ "${{ github.event.inputs.debug_mode }}" = "true" ]; then
+            echo "Debug mode enabled"
+            export LOG_LEVEL=DEBUG
+          fi
+          uv run coin-radar
+        env:
+          LOG_LEVEL: ${{ github.event.inputs.debug_mode == 'true' && 'DEBUG' || 'INFO' }}
+
+      - name: Upload logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-logs
+          path: ~/.coin_radar/coin_radar.log
+          retention-days: 7
